@@ -5,7 +5,17 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+import json
+import secrets
+from pathlib import Path
+from typing import Optional
+
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
@@ -13,6 +23,43 @@ from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+TEACHERS_FILE = Path(os.environ.get("TEACHERS_FILE", Path(__file__).with_name("teachers.json")))
+SESSION_DURATION = timedelta(hours=8)
+teacher_sessions = {}
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+class TeacherLogin(BaseModel):
+    email: str
+    password: str
+
+
+def load_teachers():
+    try:
+        with TEACHERS_FILE.open(encoding="utf-8") as teachers_file:
+            return json.load(teachers_file).get("teachers", [])
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=503, detail="Teacher credentials are unavailable") from error
+
+
+def require_teacher(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+):
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Teacher sign-in required")
+
+    session = teacher_sessions.get(credentials.credentials)
+    if session is None:
+        raise HTTPException(status_code=401, detail="Teacher session is invalid or expired")
+
+    if session["expires_at"] <= datetime.now(timezone.utc):
+        teacher_sessions.pop(credentials.credentials, None)
+        raise HTTPException(status_code=401, detail="Teacher session is invalid or expired")
+
+    return session["teacher"]
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -88,8 +135,56 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login(teacher_login: TeacherLogin):
+    email = teacher_login.email.strip().casefold()
+    teacher = next(
+        (entry for entry in load_teachers() if entry.get("email", "").strip().casefold() == email),
+        None,
+    )
+
+    if teacher is None:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        teacher_login.password.encode("utf-8"),
+        bytes.fromhex(teacher["salt"]),
+        310_000,
+    ).hex()
+    if not hmac.compare_digest(password_hash, teacher.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = secrets.token_urlsafe(32)
+    teacher_info = {"email": teacher["email"], "name": teacher["name"]}
+    teacher_sessions[token] = {
+        "teacher": teacher_info,
+        "expires_at": datetime.now(timezone.utc) + SESSION_DURATION,
+    }
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": int(SESSION_DURATION.total_seconds()),
+        "teacher": teacher_info,
+    }
+
+
+@app.get("/auth/me")
+def get_current_teacher(teacher: dict = Depends(require_teacher)):
+    return {"teacher": teacher}
+
+
+@app.post("/auth/logout")
+def logout(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    teacher: dict = Depends(require_teacher),
+):
+    teacher_sessions.pop(credentials.credentials, None)
+    return {"message": "Signed out successfully"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, teacher: dict = Depends(require_teacher)):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +206,7 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, teacher: dict = Depends(require_teacher)):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
